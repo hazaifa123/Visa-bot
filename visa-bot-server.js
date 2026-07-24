@@ -37,17 +37,20 @@ app.post('/book', validateBookingData, async (req, res) => {
 
     await browser.close();
 
+    // ✅ Success response
     res.json({
       status: 'success',
       message: `Booking attempted for ${preferred_date}`
     });
   } catch (error) {
+    // ❌ Error response
     res.status(500).json({
       status: 'error',
       message: error.message
     });
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

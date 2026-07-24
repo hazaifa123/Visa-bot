@@ -14,13 +14,13 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
       with:
-        python-version: '3.10'
+        node-version: '18'
 
     - name: Install dependencies
-      run: pip install -r requirements.txt
+      run: npm install
 
     - name: Run bot
-      run: python visa_bot.py
+      run: node visa-bot-server.js

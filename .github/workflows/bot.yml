@@ -1,26 +1,34 @@
-name: Visa Bot Automation
+name: Bot Workflow
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
     - name: Checkout repo
       uses: actions/checkout@v3
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
       with:
         node-version: '18'
 
     - name: Install dependencies
       run: npm install
 
-    - name: Run bot
-      run: node visa-bot-server.js
+    - name: Run tests
+      run: npm test
+
+    # ✅ Prevent hang: run server with timeout
+    - name: Run bot with timeout
+      run: |
+        node visa-bot-server.js &
+        sleep 10
+        kill $!
+      timeout-minutes: 1

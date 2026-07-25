@@ -133,7 +133,7 @@ async function main() {
   try {
     // Launch browser with options
     browser = await chromium.launch({ 
-      headless: false,
+      headless: true,
       slowMo: 1000 // For debugging
     });
     

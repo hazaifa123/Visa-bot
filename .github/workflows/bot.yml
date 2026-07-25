@@ -25,7 +25,7 @@ jobs:
     - name: Run tests
       run: npm test
 
-    # ✅ Prevent hang: run server with timeout
+    # Prevent hang: run server with timeout
     - name: Run bot with timeout
       run: |
         node visa-bot-server.js &

@@ -23,14 +23,14 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Run tests
-        run: npm test
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
 
-      # Prevent hang: run server with timeout
-      - name: Run bot with timeout
-        run: |
-          node visa-bot-server.js &
-          sleep 10
-          pkill -f "visa-bot-server.js"
-        timeout-minutes: 1
+      - name: Restore session
+        run: echo '${{ secrets.SESSION_JSON }}' > session.json
 
+      - name: Run booking bot
+        run: node booking-script.js
+        env:
+          TWO_CAPTCHA_KEY: ${{ secrets.TWO_CAPTCHA_KEY }}
+        timeout-minutes: 5

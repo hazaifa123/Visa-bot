@@ -30,7 +30,7 @@ jobs:
         run: echo '${{ secrets.SESSION_JSON }}' > session.json
 
       - name: Run booking bot
-        run: node booking-script.js
+        run: node visa-booking-script.js
         env:
           TWO_CAPTCHA_KEY: ${{ secrets.TWO_CAPTCHA_KEY }}
         timeout-minutes: 5

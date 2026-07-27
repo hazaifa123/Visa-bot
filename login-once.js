@@ -15,8 +15,10 @@ async function solveRecaptcha(pageUrl) {
   console.log('[INFO] Submitting captcha to 2Captcha...');
 
   // Step 1: submit the captcha job
+  // enterprise=1 is required because this site uses reCAPTCHA Enterprise
+  // (confirmed by the "exceeding reCAPTCHA Enterprise free quota" message on the login page)
   const submitRes = await fetch(
-    `http://2captcha.com/in.php?key=${TWO_CAPTCHA_KEY}&method=userrecaptcha&googlekey=${RECAPTCHA_SITE_KEY}&pageurl=${pageUrl}&json=1`
+    `http://2captcha.com/in.php?key=${TWO_CAPTCHA_KEY}&method=userrecaptcha&googlekey=${RECAPTCHA_SITE_KEY}&pageurl=${pageUrl}&enterprise=1&json=1`
   );
   const submitData = await submitRes.json();
 
@@ -92,6 +94,10 @@ async function login() {
 
     console.log('[INFO] Navigating to login page...');
     await page.goto(LOGIN_URL, { waitUntil: 'networkidle' });
+
+    // Debug: capture what the page actually looks like in this run
+    await page.screenshot({ path: 'debug-after-navigate.png', fullPage: true });
+    console.log('[INFO] Saved debug-after-navigate.png for inspection');
 
     // --- Fill credentials ---
     // Confirmed via browser inspect element on the real login page

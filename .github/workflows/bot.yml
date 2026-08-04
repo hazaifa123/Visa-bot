@@ -27,10 +27,22 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Restore session
-        run: echo '${{ secrets.SESSION_JSON }}' > session.json
+        # Use printf so newlines and special characters in the secret are preserved
+        run: |
+          printf '%s' "${{ secrets.SESSION_JSON }}" > session.json
 
       - name: Run booking bot
         run: node visa-booking-script.js
         env:
           TWO_CAPTCHA_KEY: ${{ secrets.TWO_CAPTCHA_KEY }}
-        timeout-minutes: 5
+        timeout-minutes: 15
+
+      - name: Upload diagnostics (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            error-screenshot.png
+            error-page.html
+            *.log

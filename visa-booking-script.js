@@ -7,16 +7,83 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 
+async function saveDiagnostics(page, prefix = 'error') {
+  try {
+    const screenshotPath = `${prefix}-screenshot.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    console.log(`[+] Saved screenshot to ${screenshotPath}`);
+  } catch (ssErr) {
+    console.warn("[-] Failed to save screenshot:", ssErr.message || ssErr);
+  }
+  try {
+    const html = await page.content();
+    fs.writeFileSync(`${prefix}-page.html`, html, 'utf8');
+    console.log(`[+] Saved page HTML to ${prefix}-page.html`);
+  } catch (htmlErr) {
+    console.warn("[-] Failed to save page HTML:", htmlErr.message || htmlErr);
+  }
+}
+
+async function detectBlockingPage(page) {
+  try {
+    const url = page.url();
+    const body = (await page.locator('body').innerText()).toLowerCase().slice(0, 4000);
+    if (body.includes('captcha') || (await page.$('iframe[src*="captcha"]'))) {
+      return 'captcha';
+    }
+    if (body.includes('login') || body.includes('sign in') || body.includes('sign-in') || body.includes('username')) {
+      return 'login';
+    }
+    if (url.includes('auth') || url.includes('login')) {
+      return 'login';
+    }
+  } catch (e) {
+    // ignore detection errors
+  }
+  return null;
+}
+
 async function autoSelectAvailableDateAndTime(page) {
   console.log("[+] Searching for available Date and Time...");
 
   // Make page operations more tolerant on CI
-  page.setDefaultTimeout(60000);
+  page.setDefaultTimeout(120000);
 
   // Wait for date input (try a few common selectors)
   const dateSelectorCandidates = '#datefrom, input[name="datefrom"], input[type="date"]';
   console.log("[+] Waiting for date input to appear...");
-  await page.waitForSelector(dateSelectorCandidates, { state: 'visible', timeout: 60000 });
+
+  // Retry the initial wait a few times because CI sites can be flaky
+  const maxAttempts = 3;
+  let foundDateSelector = false;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`[+] Attempt ${attempt} waiting for selector...`);
+      await page.waitForSelector(dateSelectorCandidates, { state: 'visible', timeout: 120000 });
+      foundDateSelector = true;
+      break;
+    } catch (err) {
+      console.warn(`[-] Attempt ${attempt} failed to find date input: ${err.message || err}`);
+      if (attempt < maxAttempts) {
+        const backoff = 2000 * attempt;
+        console.log(`[+] Backing off ${backoff}ms before retrying...`);
+        await page.waitForTimeout(backoff);
+      }
+    }
+  }
+
+  if (!foundDateSelector) {
+    // Capture diagnostics and detect likely blocker
+    console.error("[-] Date input not found after retries. Capturing diagnostics...");
+    await saveDiagnostics(page);
+    const blocker = await detectBlockingPage(page);
+    if (blocker === 'captcha') {
+      throw new Error('Selector not found: likely blocked by captcha (see diagnostics).');
+    } else if (blocker === 'login') {
+      throw new Error('Selector not found: likely redirected to login (session invalid or not restored).');
+    }
+    throw new Error('Selector not found: date input did not appear (see diagnostics).');
+  }
 
   // Choose the first available selector that exists
   let calendarInput;
@@ -31,7 +98,7 @@ async function autoSelectAvailableDateAndTime(page) {
   // Ensure input is in view and clickable
   await calendarInput.scrollIntoViewIfNeeded();
   try {
-    await calendarInput.click({ timeout: 60000 });
+    await calendarInput.click({ timeout: 120000 });
   } catch (err) {
     console.warn("[-] Date input initial click failed, attempting overlay close and forced click:", err.message || err);
     // Try closing common overlays that might block clicks
@@ -49,7 +116,7 @@ async function autoSelectAvailableDateAndTime(page) {
       } catch (e) { /* ignore overlay close errors */ }
     }
     // Try forced click as a fallback
-    await calendarInput.click({ force: true, timeout: 60000 });
+    await calendarInput.click({ force: true, timeout: 120000 });
   }
 
   await page.waitForTimeout(500);
@@ -92,20 +159,20 @@ async function autoSelectAvailableDateAndTime(page) {
       // Click the date; if it fails, try scrolling and forced click
       try {
         await dateElement.scrollIntoViewIfNeeded();
-        await dateElement.click({ timeout: 10000 });
+        await dateElement.click({ timeout: 15000 });
       } catch (clickErr) {
         console.warn(`[-] Click on date ${dateText} failed: ${clickErr.message || clickErr}. Trying forced click.`);
         try {
-          await dateElement.click({ force: true, timeout: 10000 });
+          await dateElement.click({ force: true, timeout: 15000 });
         } catch (forcedErr) {
           console.warn(`[-] Forced click on date ${dateText} also failed; skipping this date.`);
           // Try re-opening calendar (sometimes it closes) then continue
-          if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
-            try {
+          try {
+            if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
               await calendarInput.click({ timeout: 5000, force: true });
               await page.waitForTimeout(400);
-            } catch (_) {}
-          }
+            }
+          } catch (_) {}
           continue;
         }
       }
@@ -159,17 +226,19 @@ async function autoSelectAvailableDateAndTime(page) {
 
           // Click the slot (try normal then forced)
           try {
-            await firstSlot.click({ timeout: 10000 });
+            await firstSlot.click({ timeout: 15000 });
           } catch (slotClickErr) {
             console.warn("[-] Normal click on time slot failed:", slotClickErr.message || slotClickErr);
             try {
-              await firstSlot.click({ force: true, timeout: 10000 });
+              await firstSlot.click({ force: true, timeout: 15000 });
             } catch (forceSlotErr) {
               console.error("[-] Forced click on time slot failed:", forceSlotErr.message || forceSlotErr);
               // continue searching other dates
-              if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
-                try { await calendarInput.click({ force: true, timeout: 5000 }); } catch (_) {}
-              }
+              try {
+                if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
+                  await calendarInput.click({ force: true, timeout: 5000 });
+                }
+              } catch (_) {}
               continue;
             }
           }
@@ -244,17 +313,22 @@ async function main() {
     const page = await context.newPage();
 
     // Increase timeouts globally for CI
-    context.setDefaultTimeout(60000);
-    page.setDefaultTimeout(60000);
+    context.setDefaultTimeout(120000);
+    page.setDefaultTimeout(120000);
 
     console.log("[+] Navigating to GVC World appointment page...");
-    await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
+    const response = await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
       waitUntil: 'domcontentloaded',
-      timeout: 60000
+      timeout: 120000
     });
+    console.log(`[+] Navigation status: ${response ? response.status() : 'no-response'}, URL: ${page.url()}`);
 
     // Wait for body or main container so we reduce race conditions
-    await page.waitForSelector('body', { timeout: 60000 });
+    try {
+      await page.waitForSelector('body', { timeout: 120000 });
+    } catch (e) {
+      console.warn("[-] Body did not appear in time:", e.message || e);
+    }
 
     // Run Auto Selector
     await autoSelectAvailableDateAndTime(page);
@@ -269,20 +343,7 @@ async function main() {
         const pages = context.pages();
         if (pages.length > 0) {
           const p = pages[0];
-          try {
-            const screenshotPath = 'error-screenshot.png';
-            await p.screenshot({ path: screenshotPath, fullPage: true });
-            console.log(`[+] Saved screenshot to ${screenshotPath}`);
-          } catch (ssErr) {
-            console.warn("[-] Failed to save screenshot:", ssErr.message || ssErr);
-          }
-          try {
-            const html = await p.content();
-            fs.writeFileSync('error-page.html', html);
-            console.log("[+] Saved page HTML to error-page.html");
-          } catch (htmlErr) {
-            console.warn("[-] Failed to save page HTML:", htmlErr.message || htmlErr);
-          }
+          await saveDiagnostics(p);
         }
       }
     } catch (diagErr) {
@@ -300,7 +361,7 @@ async function main() {
   }
 }
 
-main().catch(err => {
+main().catch(async err => {
   console.error("Fatal error:", err && err.message ? err.message : err);
   process.exit(1);
 });

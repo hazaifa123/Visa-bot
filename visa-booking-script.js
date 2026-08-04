@@ -6,63 +6,78 @@ const readline = require('readline');
 const TWO_CAPTCHA_KEY = '4b29fd7a5c40a53364d950b106fc7620'; 
 const RECAPTCHA_SITE_KEY = '6LcnlCoUAAAAAJLjWXXaByTFyuOLf4K0gGu5r3d2';
 
-// Enhanced data structure with validation
+// Sample User Data (Change according to your needs)
+const data = {
+  email: 'user@example.com',
+  phone: '03001234567',
+  gender: 'M', // 'M' for Male, 'F' for Female
+  dob: { day: '15', month: '05', year: '1995' }, // Format: DD/MM/YYYY
+  passportExpiry: { day: '10', month: 'aug', year: '2030' }
+};
+
 const validateAndFormatData = (data) => {
   if (!data.email || !data.phone || !data.dob) throw new Error("Missing required data");
   return {
     ...data,
+    dobFormatted: `${String(data.dob.day).padStart(2, '0')}/${String(data.dob.month).padStart(2, '0')}/${data.dob.year}`,
     dob: {
       day: String(data.dob.day),
       month: String(data.dob.month),
       year: String(data.dob.year)
-    },
-    passportExpiry: {
-      day: String(data.passportExpiry.day),
-      month: data.passportExpiry.month.toLowerCase(),
-      year: String(data.passportExpiry.year)
     }
   };
 };
 
-// Improved OTP handling with better selectors
-async function handleOTP(page, otp) {
+// ==========================================
+// 1. FIX: DOB & GENDER FILL FUNCTION
+// ==========================================
+async function fillFormData(page, formData) {
   try {
-    // Find OTP input with multiple fallbacks
-    const otpSelectors = [
-      'input[name="otp"]',
-      'input[id*="otp"]',
-      'input[type="text"][maxlength="6"]',
-      '#otp_input_field'
-    ];
-    
-    let otpInput = null;
-    for (const sel of otpSelectors) {
-      if (await page.locator(sel).count() > 0) {
-        otpInput = page.locator(sel);
-        break;
-      }
+    console.log("[+] Filling Form Data...");
+
+    // 1. Fill Gender (Supports Radio Button or Select Dropdown)
+    const genderSelect = page.locator('select[name="gender"], #gender');
+    const genderRadio = page.locator(`input[name="gender"][value="${formData.gender}"], #gender_${formData.gender}`);
+
+    if (await genderSelect.count() > 0) {
+      await genderSelect.selectOption(formData.gender);
+      console.log("[+] Gender selected (Dropdown)");
+    } else if (await genderRadio.count() > 0) {
+      await genderRadio.check({ force: true }); // Force click to bypass custom label CSS
+      console.log("[+] Gender selected (Radio)");
     }
-    
-    if (!otpInput) throw new Error("Could not find OTP input");
-    
-    await otpInput.fill(otp.trim());
-    console.log("[+] OTP entered successfully");
-    
-    // Find verify button
-    const verifyBtn = page.getByRole('button', { name: /verify|confirm|submit|continue/i });
-    if (await verifyBtn.count() > 0) {
-      await verifyBtn.click({ timeout: 5000 });
-      console.log("[+] Verification submitted");
+
+    // 2. Fill Date of Birth (DOB)
+    const dobSelector = '#dob, input[name="dob"], input[name="date_of_birth"]';
+    const dobInput = page.locator(dobSelector);
+
+    if (await dobInput.count() > 0) {
+      // Inject date via JavaScript to trigger website's validation scripts
+      await page.evaluate(({ selector, dateStr }) => {
+        const input = document.querySelector(selector);
+        if (input) {
+          input.removeAttribute('readonly');
+          input.value = dateStr;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          input.dispatchEvent(new Event('blur', { bubbles: true }));
+        }
+      }, { selector: dobSelector, dateStr: formData.dobFormatted });
+
+      console.log(`[+] Date of Birth set to: ${formData.dobFormatted}`);
     } else {
-      console.log("[!] Warning: Could not find verify button, continuing anyway");
+      console.log("[!] Warning: DOB field not found with standard selector");
     }
+
   } catch (err) {
-    console.error("OTP handling error:", err.message);
+    console.error("Form filling error:", err.message);
     throw err;
   }
 }
 
-// Enhanced slot finder with better error handling
+// ==========================================
+// 2. FIX: APPOINTMENT CALENDAR SLOT FINDER
+// ==========================================
 async function findAvailableSlot(page) {
   try {
     const MAX_ATTEMPTS = 30;
@@ -72,50 +87,52 @@ async function findAvailableSlot(page) {
       attempt++;
       console.log(`[+] Attempting slot search (${attempt}/${MAX_ATTEMPTS})`);
       
-      // Navigate to calendar
-      await page.locator('#appointment_date').click();
-      
-      // Skip ahead to next month if needed
+      // FIXED: Correct ID for GVC World calendar is '#datefrom'
+      const calendarInput = page.locator('#datefrom');
+      await calendarInput.click();
+      await page.waitForTimeout(500);
+
+      // Next month navigation if needed
       if (attempt > 1) {
-        await page.locator('.ui-datepicker-next').click();
+        const nextBtn = page.locator('.ui-datepicker-next');
+        if (await nextBtn.isVisible()) {
+          await nextBtn.click();
+          await page.waitForTimeout(500);
+        }
       }
       
-      // Wait for calendar to load
-      await page.waitForTimeout(500);
-      
-      // Get available dates
-      const dateLinks = page.locator('.ui-datepicker-calendar a:not(.ui-state-disabled)');
+      // Get available (selectable) dates in jQuery UI Datepicker
+      const dateLinks = page.locator('.ui-datepicker-calendar td:not(.ui-state-disabled) a');
       const count = await dateLinks.count();
       
       if (count === 0) {
-        console.log("[-] No dates available in current view");
+        console.log("[-] No dates available in current calendar view");
         continue;
       }
       
-      // Try each date
+      // Try clicking dates
       for (let i = 0; i < Math.min(count, 7); i++) {
         const link = dateLinks.nth(i);
         const dateLabel = await link.textContent();
         
         console.log(`[+] Checking date: ${dateLabel}`);
-        
         await link.click();
-        await page.locator('#search_appointment').click();
         
-        // Wait for results
-        await page.waitForTimeout(1000);
+        // Wait for appointment box / slot div to update via AJAX
+        await page.waitForTimeout(1200);
         
-        // Check for slots
-        const slots = page.locator('div.appointment_slot.appointment_slot_enabled');
+        // Check if slots are visible in resultMessage or appointment_box
+        const slots = page.locator('#appointment_box .appointment_slot, .appointment_slot_enabled, #appointmentmethodDiv div');
         if (await slots.count() > 0) {
           const firstSlot = slots.first();
           const time = await firstSlot.textContent();
           
-          console.log(`[+] Found slot: ${time} on ${dateLabel}`);
+          console.log(`[+] Found available slot: ${time.trim()} on date ${dateLabel}`);
+          await firstSlot.click();
           return { slot: firstSlot, date: dateLabel };
         }
         
-        console.log(`[-] No slots available on ${dateLabel}`);
+        console.log(`[-] No slots available on date ${dateLabel}`);
       }
     }
     
@@ -126,51 +143,44 @@ async function findAvailableSlot(page) {
   }
 }
 
-// Main function with improved error handling
+// Dummy captcha handler placeholder
+async function handleRecaptcha(page) {
+  console.log("[+] Handling reCAPTCHA...");
+  await page.waitForTimeout(1000);
+}
+
+// Main function
 async function main() {
   let browser;
   
   try {
-    // Launch browser with options
     browser = await chromium.launch({ 
-      headless: true,
-      slowMo: 1000 // For debugging
+      headless: false, // Set to false to see what browser is doing
+      slowMo: 500
     });
     
-    const context = await browser.newContext({ storageState: 'session.json' });
+    const context = await browser.newContext();
     const page = await context.newPage();
     
-    // Set timeouts
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(60000);
     
-    // Navigate to booking page
+    console.log("[+] Navigating to GVC World appointment page...");
     await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
       waitUntil: 'networkidle',
       timeout: 30000
     });
     
-    // Handle initial reCAPTCHA
-    await handleRecaptcha(page);
-    
-    // Fill form data
+    // Fill form data (DOB, Gender, etc.)
     await fillFormData(page, validateAndFormatData(data));
     
-    // Find available slot
+    // Find available slot from calendar
     const slotInfo = await findAvailableSlot(page);
     
-    // Handle final reCAPTCHA
-    await handleRecaptcha(page);
-    
-    // Submit form
-    await page.getByRole('button', { name: /submit|book|complete/i }).click();
-    
-    console.log("[+] Booking completed successfully");
+    console.log("[+] Slot selected successfully:", slotInfo);
     
   } catch (err) {
     console.error("Booking error:", err.message);
-    if (browser) await browser.close();
-    process.exit(1);
   }
 }
 

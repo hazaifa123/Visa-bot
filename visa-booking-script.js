@@ -78,23 +78,54 @@ async function autoSelectAvailableDateAndTime(page) {
 
 // Main Execution
 async function main() {
+  // Allow overriding headless from environment; default = true (safe for CI)
+  const headless = process.env.HEADLESS ? process.env.HEADLESS !== 'false' : true;
+
   const browser = await chromium.launch({
-    headless: false, // Set to true if you don't want the browser window to pop up
-    slowMo: 400
+    headless,
+    // recommended flags for running Chromium on CI (GitHub Actions)
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-dev-tools',
+      '--single-process',
+      '--disable-background-networking'
+    ]
   });
 
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  let context;
+  try {
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 720 }
+    });
+    const page = await context.newPage();
 
-  console.log("[+] Navigating to GVC World appointment page...");
-  await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
-    waitUntil: 'networkidle'
-  });
+    console.log("[+] Navigating to GVC World appointment page...");
+    await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
+      waitUntil: 'networkidle'
+    });
 
-  // Run Auto Selector
-  await autoSelectAvailableDateAndTime(page);
+    // Run Auto Selector
+    await autoSelectAvailableDateAndTime(page);
 
-  console.log("[+] Done!");
+    console.log("[+] Done!");
+  } catch (err) {
+    console.error("[-] Script error:", err);
+    throw err;
+  } finally {
+    try {
+      if (context) await context.close();
+      await browser.close();
+    } catch (closeErr) {
+      console.warn("[-] Error closing browser/context:", closeErr);
+    }
+  }
 }
 
-main();
+main().catch(err => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});

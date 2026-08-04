@@ -29,7 +29,7 @@ jobs:
       - name: Restore session
         # Use printf so newlines and special characters in the secret are preserved
         run: |
-          printf '%s' "${{ secrets.SESSION_JSON }}" > session.json
+          echo "${{ secrets.SESSION_JSON }}" | base64 -d > session.json
 
       - name: Run booking bot
         run: node visa-booking-script.js

@@ -27,10 +27,9 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Restore session
-        # Use printf so newlines and special characters in the secret are preserved
         run: |
-          echo "${{ secrets.SESSION_JSON }}" | base64 -d > session.json
-
+         echo "${{ secrets.SESSION_JSON }}" | base64 -d --ignore-garbage > session.json
+    
       - name: Run booking bot
         run: node visa-booking-script.js
         env:

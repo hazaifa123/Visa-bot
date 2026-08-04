@@ -1,367 +1,236 @@
-/**
- * visa-booking-script.js
- * - Automatically finds and selects the first available Date and Time Slot.
- * - Improved for CI: explicit waits, overlay handling, diagnostics on failure.
- */
-
+require('dotenv').config();
 const { chromium } = require('playwright');
-const fs = require('fs');
+const fetch = require('node-fetch');
 
-async function saveDiagnostics(page, prefix = 'error') {
-  try {
-    const screenshotPath = `${prefix}-screenshot.png`;
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    console.log(`[+] Saved screenshot to ${screenshotPath}`);
-  } catch (ssErr) {
-    console.warn("[-] Failed to save screenshot:", ssErr.message || ssErr);
+// Configuration
+const TWO_CAPTCHA_KEY = process.env.TWO_CAPTCHA_KEY || '4b29fd7a5c40a53364d950b106fc7620';
+const RECAPTCHA_SITE_KEY = '6LcnlCoUAAAAAJLjWXXaByTFyuOLf4K0gGu5r3d2';
+
+const bookingData = {
+  email: process.env.VISA_EMAIL || 'user@example.com',
+  phone: process.env.VISA_PHONE || '03001234567',
+  dob: {
+    day: process.env.VISA_DOB_DAY || '01',
+    month: process.env.VISA_DOB_MONTH || '01',
+    year: process.env.VISA_DOB_YEAR || '1990'
+  },
+  passportExpiry: {
+    day: process.env.VISA_PASSPORT_EXPIRY_DAY || '01',
+    month: process.env.VISA_PASSPORT_EXPIRY_MONTH || '12',
+    year: process.env.VISA_PASSPORT_EXPIRY_YEAR || '2030'
   }
-  try {
-    const html = await page.content();
-    fs.writeFileSync(`${prefix}-page.html`, html, 'utf8');
-    console.log(`[+] Saved page HTML to ${prefix}-page.html`);
-  } catch (htmlErr) {
-    console.warn("[-] Failed to save page HTML:", htmlErr.message || htmlErr);
+};
+
+const validateAndFormatData = (data) => {
+  if (!data.email || !data.phone || !data.dob) {
+    throw new Error('Missing required booking data');
   }
+
+  return {
+    ...data,
+    dob: {
+      day: String(data.dob.day),
+      month: String(data.dob.month),
+      year: String(data.dob.year)
+    },
+    passportExpiry: {
+      day: String(data.passportExpiry.day),
+      month: String(data.passportExpiry.month).toLowerCase(),
+      year: String(data.passportExpiry.year)
+    }
+  };
+};
+
+async function solveRecaptcha(pageUrl) {
+  console.log('[+] Submitting captcha to 2Captcha...');
+
+  const submitRes = await fetch(
+    `http://2captcha.com/in.php?key=${TWO_CAPTCHA_KEY}&method=userrecaptcha&googlekey=${RECAPTCHA_SITE_KEY}&pageurl=${pageUrl}&enterprise=1&json=1`
+  );
+  const submitData = await submitRes.json();
+
+  if (submitData.status !== 1) {
+    throw new Error(`2Captcha submit failed: ${submitData.request}`);
+  }
+
+  const requestId = submitData.request;
+  console.log(`[+] Captcha job submitted, id: ${requestId}. Waiting for solution...`);
+
+  const maxAttempts = 24;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const resultRes = await fetch(
+      `http://2captcha.com/res.php?key=${TWO_CAPTCHA_KEY}&action=get&id=${requestId}&json=1`
+    );
+    const resultData = await resultRes.json();
+
+    if (resultData.status === 1) {
+      console.log('[+] Captcha solved');
+      return resultData.request;
+    }
+
+    if (resultData.request !== 'CAPCHA_NOT_READY') {
+      throw new Error(`2Captcha error: ${resultData.request}`);
+    }
+
+    console.log(`[+] Waiting for captcha solution (${attempt + 1}/${maxAttempts})...`);
+  }
+
+  throw new Error('2Captcha timed out waiting for a solution');
 }
 
-async function detectBlockingPage(page) {
-  try {
-    const url = page.url();
-    const body = (await page.locator('body').innerText()).toLowerCase().slice(0, 4000);
-    if (body.includes('captcha') || (await page.$('iframe[src*="captcha"]'))) {
-      return 'captcha';
-    }
-    if (body.includes('login') || body.includes('sign in') || body.includes('sign-in') || body.includes('username')) {
-      return 'login';
-    }
-    if (url.includes('auth') || url.includes('login')) {
-      return 'login';
-    }
-  } catch (e) {
-    // ignore detection errors
-  }
-  return null;
-}
-
-async function autoSelectAvailableDateAndTime(page) {
-  console.log("[+] Searching for available Date and Time...");
-
-  // Make page operations more tolerant on CI
-  page.setDefaultTimeout(120000);
-
-  // Wait for date input (try a few common selectors)
-  const dateSelectorCandidates = '#datefrom, input[name="datefrom"], input[type="date"]';
-  console.log("[+] Waiting for date input to appear...");
-
-  // Retry the initial wait a few times because CI sites can be flaky
-  const maxAttempts = 3;
-  let foundDateSelector = false;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      console.log(`[+] Attempt ${attempt} waiting for selector...`);
-      await page.waitForSelector(dateSelectorCandidates, { state: 'visible', timeout: 120000 });
-      foundDateSelector = true;
-      break;
-    } catch (err) {
-      console.warn(`[-] Attempt ${attempt} failed to find date input: ${err.message || err}`);
-      if (attempt < maxAttempts) {
-        const backoff = 2000 * attempt;
-        console.log(`[+] Backing off ${backoff}ms before retrying...`);
-        await page.waitForTimeout(backoff);
-      }
-    }
-  }
-
-  if (!foundDateSelector) {
-    // Capture diagnostics and detect likely blocker
-    console.error("[-] Date input not found after retries. Capturing diagnostics...");
-    await saveDiagnostics(page);
-    const blocker = await detectBlockingPage(page);
-    if (blocker === 'captcha') {
-      throw new Error('Selector not found: likely blocked by captcha (see diagnostics).');
-    } else if (blocker === 'login') {
-      throw new Error('Selector not found: likely redirected to login (session invalid or not restored).');
-    }
-    throw new Error('Selector not found: date input did not appear (see diagnostics).');
-  }
-
-  // Choose the first available selector that exists
-  let calendarInput;
-  if (await page.$('#datefrom')) {
-    calendarInput = page.locator('#datefrom');
-  } else if (await page.$('input[name="datefrom"]')) {
-    calendarInput = page.locator('input[name="datefrom"]');
-  } else {
-    calendarInput = page.locator('input[type="date"]');
-  }
-
-  // Ensure input is in view and clickable
-  await calendarInput.scrollIntoViewIfNeeded();
-  try {
-    await calendarInput.click({ timeout: 120000 });
-  } catch (err) {
-    console.warn("[-] Date input initial click failed, attempting overlay close and forced click:", err.message || err);
-    // Try closing common overlays that might block clicks
-    const overlaySelectors = [
-      '.modal-close', '.cookie-accept', '.cookie-consent button', '.cookie-banner button',
-      '.consent-btn', '.close', '#cookie-consent button'
-    ];
-    for (const sel of overlaySelectors) {
-      try {
-        const overlay = page.locator(sel);
-        if (await overlay.count() > 0 && await overlay.isVisible()) {
-          await overlay.first().click({ timeout: 5000, force: true }).catch(() => {});
-          await page.waitForTimeout(400);
-        }
-      } catch (e) { /* ignore overlay close errors */ }
-    }
-    // Try forced click as a fallback
-    await calendarInput.click({ force: true, timeout: 120000 });
-  }
-
-  await page.waitForTimeout(500);
-
-  // Check up to 6 months ahead
-  const maxMonths = 6;
-
-  for (let month = 0; month < maxMonths; month++) {
-    // Ensure calendar is visible for this month
-    await page.waitForTimeout(300);
-    if (!(await page.locator('.ui-datepicker-calendar').count() > 0)) {
-      // If the calendar isn't present, try re-opening it
-      try {
-        await calendarInput.click({ timeout: 5000, force: false });
-        await page.waitForTimeout(300);
-      } catch (_) { /* ignore */ }
+async function injectRecaptchaToken(page, token) {
+  await page.evaluate((token) => {
+    const textarea = document.getElementById('g-recaptcha-response');
+    if (textarea) {
+      textarea.style.display = 'block';
+      textarea.value = token;
     }
 
-    // Re-evaluate available date links in the current month view to avoid stale locators
-    const availableDateLinks = page.locator('.ui-datepicker-calendar td:not(.ui-state-disabled) a');
-    // Wait for the calendar grid to be attached or time out quickly if not
-    try {
-      await page.waitForSelector('.ui-datepicker-calendar', { state: 'visible', timeout: 10000 });
-    } catch (_) {
-      // Calendar not visible; continue to next month button or attempt to reopen
-    }
-
-    const dateCount = await availableDateLinks.count();
-    console.log(`[+] Month ${month + 1}: Found ${dateCount} selectable date(s)`);
-
-    for (let i = 0; i < dateCount; i++) {
-      // Re-create locator each iteration to avoid stale element handles
-      const dateElement = page.locator('.ui-datepicker-calendar td:not(.ui-state-disabled) a').nth(i);
-
-      let dateText = await dateElement.textContent().catch(() => null);
-      dateText = (dateText || '').trim() || `#${i + 1}`;
-
-      console.log(`[+] Testing Date: Day ${dateText}`);
-
-      // Click the date; if it fails, try scrolling and forced click
-      try {
-        await dateElement.scrollIntoViewIfNeeded();
-        await dateElement.click({ timeout: 15000 });
-      } catch (clickErr) {
-        console.warn(`[-] Click on date ${dateText} failed: ${clickErr.message || clickErr}. Trying forced click.`);
-        try {
-          await dateElement.click({ force: true, timeout: 15000 });
-        } catch (forcedErr) {
-          console.warn(`[-] Forced click on date ${dateText} also failed; skipping this date.`);
-          // Try re-opening calendar (sometimes it closes) then continue
-          try {
-            if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
-              await calendarInput.click({ timeout: 5000, force: true });
-              await page.waitForTimeout(400);
+    if (window.___grecaptcha_cfg) {
+      Object.values(window.___grecaptcha_cfg.clients || {}).forEach((client) => {
+        Object.values(client || {}).forEach((obj) => {
+          if (obj && typeof obj.callback === 'function') {
+            try {
+              obj.callback(token);
+            } catch (error) {
+              console.warn('Captcha callback error:', error);
             }
-          } catch (_) {}
-          continue;
-        }
-      }
+          }
+        });
+      });
+    }
+  }, token);
+}
 
-      // Wait a short while for time slots to load (AJAX)
+async function handleRecaptcha(page) {
+  const hasRecaptcha =
+    (await page.locator('iframe[src*="recaptcha"]').count()) > 0 ||
+    (await page.locator('#g-recaptcha-response').count()) > 0;
+
+  if (!hasRecaptcha) {
+    return;
+  }
+
+  const token = await solveRecaptcha(page.url());
+  await injectRecaptchaToken(page, token);
+  await page.waitForTimeout(1500);
+}
+
+async function fillFormData(page, data) {
+  const fill = async (selector, value) => {
+    const locator = page.locator(selector);
+    if (await locator.count() > 0) {
+      await locator.fill(value);
+      return true;
+    }
+    return false;
+  };
+
+  await fill('input[name="email"], input#email', data.email);
+  await fill('input[name="phone"], input#phone, input[name="mobile"]', data.phone);
+  await fill('input[name="dob_day"], input#dob_day, input[name="day"]', data.dob.day);
+  await fill('input[name="dob_month"], input#dob_month, input[name="month"]', data.dob.month);
+  await fill('input[name="dob_year"], input#dob_year, input[name="year"]', data.dob.year);
+  await fill('input[name="passportExpiry_day"], input#passport_expiry_day, input[name="passport_day"]', data.passportExpiry.day);
+  await fill('input[name="passportExpiry_month"], input#passport_expiry_month, input[name="passport_month"]', data.passportExpiry.month);
+  await fill('input[name="passportExpiry_year"], input#passport_expiry_year, input[name="passport_year"]', data.passportExpiry.year);
+
+  console.log('[+] Booking form data filled');
+}
+
+async function findAvailableSlot(page) {
+  const MAX_ATTEMPTS = 30;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    console.log(`[+] Attempting slot search (${attempt}/${MAX_ATTEMPTS})`);
+
+    await page.locator('#appointment_date').click();
+    if (attempt > 1) {
+      const nextButton = page.locator('.ui-datepicker-next');
+      if (await nextButton.count() > 0) {
+        await nextButton.click();
+      }
+    }
+
+    await page.waitForTimeout(700);
+    const dateLinks = page.locator('.ui-datepicker-calendar a:not(.ui-state-disabled)');
+    const count = await dateLinks.count();
+
+    if (count === 0) {
+      console.log('[-] No dates available in current view');
+      continue;
+    }
+
+    for (let i = 0; i < Math.min(count, 7); i++) {
+      const link = dateLinks.nth(i);
+      const dateLabel = (await link.textContent())?.trim() || `date-${i + 1}`;
+
+      console.log(`[+] Checking date: ${dateLabel}`);
+      await link.click();
+      await page.locator('#search_appointment').click();
       await page.waitForTimeout(1200);
 
-      // Wait up to a short timeout for appointment containers to appear (non-blocking)
-      const appointmentContainerPresent = await page.locator('#appointmentmethodDiv, #appointment_box').count() > 0;
-      if (appointmentContainerPresent) {
-        // Look for known time slot elements: radio inputs, labels, or generic slot blocks
-        const timeSlots = page.locator('#appointmentmethodDiv input[type="radio"], #appointmentmethodDiv label, #appointment_box .appointment_slot, #appointment_box .slot, .appointment_slot');
-        const slotCount = await timeSlots.count();
-
-        console.log(`[+] Found ${slotCount} time slot element(s) after selecting Day ${dateText}`);
-
-        if (slotCount > 0) {
-          // Pick the first actionable slot and click it
-          const firstSlot = timeSlots.first();
-
-          // Try to read a human-friendly time label
-          let timeText = await firstSlot.textContent().catch(() => null);
-          timeText = (timeText || '').trim();
-
-          // If text is empty and it's an input radio, try to get the associated label or value
-          if (!timeText) {
-            try {
-              const tagName = (await firstSlot.evaluate(node => node.tagName)).toLowerCase();
-              if (tagName === 'input') {
-                // Try to find a sibling label that references the input's id
-                const id = await firstSlot.getAttribute('id');
-                if (id) {
-                  const label = page.locator(`label[for="${id}"]`);
-                  if ((await label.count()) > 0) {
-                    timeText = (await label.textContent()).trim();
-                  }
-                }
-                if (!timeText) {
-                  // fallback to value attribute
-                  timeText = (await firstSlot.getAttribute('value')) || '';
-                }
-              } else {
-                // fallback to outer text
-                timeText = (await firstSlot.textContent()) || '';
-              }
-            } catch (_) {
-              timeText = timeText || '';
-            }
-            timeText = timeText.trim();
-          }
-
-          // Click the slot (try normal then forced)
-          try {
-            await firstSlot.click({ timeout: 15000 });
-          } catch (slotClickErr) {
-            console.warn("[-] Normal click on time slot failed:", slotClickErr.message || slotClickErr);
-            try {
-              await firstSlot.click({ force: true, timeout: 15000 });
-            } catch (forceSlotErr) {
-              console.error("[-] Forced click on time slot failed:", forceSlotErr.message || forceSlotErr);
-              // continue searching other dates
-              try {
-                if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
-                  await calendarInput.click({ force: true, timeout: 5000 });
-                }
-              } catch (_) {}
-              continue;
-            }
-          }
-
-          console.log(`\n==============================================`);
-          console.log(`[SUCCESS] Selected Date : Day ${dateText}`);
-          console.log(`[SUCCESS] Selected Time : ${timeText || 'First Slot'}`);
-          console.log(`==============================================\n`);
-
-          return { date: dateText, time: timeText || 'Slot 1' };
-        } else {
-          console.log(`[-] No time slots available on Day ${dateText}`);
-        }
-      } else {
-        console.log(`[-] Appointment containers not present after selecting Day ${dateText}`);
+      const slots = page.locator('div.appointment_slot.appointment_slot_enabled');
+      if (await slots.count() > 0) {
+        const slot = slots.first();
+        const time = (await slot.textContent())?.trim() || 'unknown time';
+        console.log(`[+] Found slot: ${time} on ${dateLabel}`);
+        return { slot, date: dateLabel, time };
       }
 
-      // If calendar closed, re-open it so we can continue iterating
-      try {
-        if (!(await page.locator('.ui-datepicker-calendar').isVisible())) {
-          await calendarInput.click({ timeout: 5000 });
-          await page.waitForTimeout(400);
-        }
-      } catch (_) { /* ignore */ }
-    } // end for each date in month
-
-    // No slots found this month: move to next month if possible
-    const nextMonthBtn = page.locator('.ui-datepicker-next');
-    if (await nextMonthBtn.count() > 0 && await nextMonthBtn.isVisible()) {
-      console.log("[+] Moving to next month...");
-      try {
-        await nextMonthBtn.click({ timeout: 5000 });
-      } catch (nextErr) {
-        console.warn("[-] Next month click failed, trying forced click:", nextErr.message || nextErr);
-        try { await nextMonthBtn.click({ force: true, timeout: 5000 }); } catch (_) { break; }
-      }
-      await page.waitForTimeout(600);
-    } else {
-      // Can't navigate further
-      break;
+      console.log(`[-] No slots available on ${dateLabel}`);
     }
-  } // end months loop
+  }
 
-  throw new Error("No available dates or time slots found.");
+  throw new Error('No available slots found');
 }
 
-// Main Execution
 async function main() {
-  // Allow overriding headless from environment; default = true (safe for CI)
-  const headless = process.env.HEADLESS ? process.env.HEADLESS !== 'false' : true;
+  let browser;
 
-  const browser = await chromium.launch({
-    headless,
-    // recommended flags for running Chromium on CI (GitHub Actions)
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--disable-dev-tools',
-      // removed '--single-process' because it can cause instability in CI
-      '--disable-background-networking'
-    ]
-  });
-
-  let context;
   try {
-    context = await browser.newContext({
-      viewport: { width: 1280, height: 720 }
-    });
+    browser = await chromium.launch({ headless: true, slowMo: 1000 });
+    const context = await browser.newContext({ storageState: 'session.json' });
     const page = await context.newPage();
 
-    // Increase timeouts globally for CI
-    context.setDefaultTimeout(120000);
-    page.setDefaultTimeout(120000);
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(60000);
 
-    console.log("[+] Navigating to GVC World appointment page...");
-    const response = await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
-      waitUntil: 'domcontentloaded',
-      timeout: 120000
+    await page.goto('https://pk-gr-services.gvcworld.eu/appointments/add', {
+      waitUntil: 'networkidle',
+      timeout: 30000
     });
-    console.log(`[+] Navigation status: ${response ? response.status() : 'no-response'}, URL: ${page.url()}`);
 
-    // Wait for body or main container so we reduce race conditions
-    try {
-      await page.waitForSelector('body', { timeout: 120000 });
-    } catch (e) {
-      console.warn("[-] Body did not appear in time:", e.message || e);
-    }
+    await handleRecaptcha(page);
+    await fillFormData(page, validateAndFormatData(bookingData));
 
-    // Run Auto Selector
-    await autoSelectAvailableDateAndTime(page);
+    const slotInfo = await findAvailableSlot(page);
+    await slotInfo.slot.click();
+    console.log(`[+] Selected appointment slot: ${slotInfo.date} at ${slotInfo.time}`);
 
-    console.log("[+] Done!");
-  } catch (err) {
-    console.error("[-] Script error:", err && err.message ? err.message : err);
+    await page.waitForTimeout(500);
+    await handleRecaptcha(page);
 
-    // Try to save diagnostics (screenshot + HTML) if page is available
-    try {
-      if (context) {
-        const pages = context.pages();
-        if (pages.length > 0) {
-          const p = pages[0];
-          await saveDiagnostics(p);
-        }
+    const submitBtn = page.getByRole('button', { name: /submit|book|complete|confirm/i });
+    if (await submitBtn.count() > 0) {
+      await submitBtn.click();
+    } else {
+      const fallback = page.locator('button[type="submit"], input[type="submit"], button:has-text("Book"), button:has-text("Confirm")');
+      if (await fallback.count() > 0) {
+        await fallback.first().click();
+      } else {
+        throw new Error('Unable to find booking submit button');
       }
-    } catch (diagErr) {
-      console.warn("[-] Failed to capture diagnostics:", diagErr.message || diagErr);
     }
 
-    throw err;
-  } finally {
-    try {
-      if (context) await context.close();
-      await browser.close();
-    } catch (closeErr) {
-      console.warn("[-] Error closing browser/context:", closeErr.message || closeErr);
-    }
+    console.log('[+] Booking completed successfully');
+    await browser.close();
+  } catch (err) {
+    console.error('Booking error:', err.message);
+    if (browser) await browser.close();
+    process.exit(1);
   }
 }
 
-main().catch(async err => {
-  console.error("Fatal error:", err && err.message ? err.message : err);
-  process.exit(1);
-});
+main();
+
